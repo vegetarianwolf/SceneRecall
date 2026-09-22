@@ -8,6 +8,8 @@ from .library import Library, atomic_json, digest, now, read_json, uid
 from .models import AnalysisInput
 from .providers import MAX_OUTPUT_TOKENS, PROMPT_VERSION
 
+CODEX_COST_BUDGET_MESSAGE = "Codex CLI 使用账户订阅额度，无法按 API 单价计算金额预算；请移除费用预算并保留请求数预算"
+
 
 class StopJob(Exception):
     pass
@@ -15,7 +17,12 @@ class StopJob(Exception):
 
 def model_identity(profile: dict) -> dict:
     """Only settings affecting model output belong in recognition cache keys."""
-    return {key: profile.get(key) for key in ("protocol", "base_url", "model")}
+    # Preserve the exact legacy API identity so upgrades reuse paid recognition.
+    identity = {key: profile.get(key) for key in ("protocol", "base_url", "model")}
+    provider_type = profile.get("provider_type") or "openai_compatible"
+    if provider_type != "openai_compatible":
+        identity["provider_type"] = provider_type
+    return identity
 
 
 def error_message(exc: Exception) -> str:
@@ -126,6 +133,8 @@ class JobQueue:
             profile = self.providers.get(profile_id)
             if stage not in profile.get("capabilities", []):
                 raise ValueError(f"模型未声明 {stage} 能力，请检查连接配置")
+            if request.max_cost is not None and profile.get("provider_type") == "codex_cli":
+                raise ValueError(CODEX_COST_BUDGET_MESSAGE)
             if request.max_cost is not None and (profile.get("input_price_per_million") is None or profile.get("output_price_per_million") is None):
                 raise ValueError("设置费用预算前，请填写所用模型的输入与输出单价")
             snapshots[stage] = profile
@@ -147,14 +156,19 @@ class JobQueue:
                 unit = self.estimated_call_cost(profile, frame_count)
                 unknown |= unit is None
                 estimate_cost += (unit or 0) * count
+        warnings = ["请求数为切镜前估算，快速剪辑会增加窗口数；字幕去重可能减少请求。",
+                    "估算不含自动向量索引；重试最多三次。费用以供应商实际用量为准。",
+                    "请求数不足或预算不足时任务暂停，不会自动扩大预算。"]
+        if any(profile.get("provider_type") == "codex_cli" for profile in config["profile_snapshots"].values()):
+            warnings.append("Codex CLI 由已登录账户的订阅额度管理，金额费用未知，并不表示免费；请求数预算仍生效。")
         return {"duration_ms": duration, "estimated_frames": vision * request.frames_per_window + subtitle_frames,
                 "estimated_requests": vision + subtitle_requests, "cost_estimate": None if unknown else round(estimate_cost, 6),
-                "currency": "USD", "warnings": ["请求数为切镜前估算，快速剪辑会增加窗口数；字幕去重可能减少请求。",
-                "估算不含自动向量索引；重试最多三次。费用以供应商实际用量为准。",
-                "请求数不足或预算不足时任务暂停，不会自动扩大预算。"]}
+                "currency": "USD", "warnings": warnings}
 
     @staticmethod
     def estimated_call_cost(profile: dict, frames: int = 0, text_count: int = 1):
+        if profile.get("provider_type") == "codex_cli":
+            return None
         a, b = profile.get("input_price_per_million"), profile.get("output_price_per_million")
         if a is None or b is None:
             return None
@@ -182,6 +196,10 @@ class JobQueue:
                         if key == "max_requests" and (not isinstance(value, int) or value > 100000):
                             raise ValueError("请求预算必须是 1–100000 的整数")
                         config[key] = value
+            if config.get("max_cost") is not None and any(
+                    profile.get("provider_type") == "codex_cli"
+                    for profile in config.get("profile_snapshots", {}).values()):
+                raise ValueError(CODEX_COST_BUDGET_MESSAGE)
             return self.update(job_id, status="queued", config=config, error=None, failures=[], message="等待恢复，复用成功结果")
         raise ValueError("当前任务状态不支持此操作")
 
@@ -199,7 +217,7 @@ class JobQueue:
         job = self.checkpoint(job_id)
         current_profile = self.providers.get(profile["id"])
         if model_identity(current_profile) != model_identity(profile):
-            self.update(job_id, status="paused", message="任务所用模型地址或名称已变化，请还原配置后继续或创建新任务")
+            self.update(job_id, status="paused", message="任务所用连接类型、模型地址或名称已变化，请还原配置后继续或创建新任务")
             raise StopJob()
         count_budget = job["config"].get("max_requests", 1000)
         if job["request_count"] + 3 > count_budget:
@@ -207,6 +225,9 @@ class JobQueue:
             raise StopJob()
         max_cost = job["config"].get("max_cost")
         if max_cost:
+            if current_profile.get("provider_type") == "codex_cli":
+                self.update(job_id, status="paused", message=CODEX_COST_BUDGET_MESSAGE)
+                raise StopJob()
             if job.get("cost_incomplete"):
                 self.update(job_id, status="paused", message="供应商未返回完整费用用量；当前费用未知，请核对账单或移除费用预算后继续")
                 raise StopJob()

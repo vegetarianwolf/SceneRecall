@@ -1,18 +1,31 @@
 export type Capability = 'vision' | 'subtitle' | 'embedding' | 'query' | 'decision' | 'answer';
 export type AssetKind = 'movie' | 'animation' | 'series';
+export type ProviderType = 'openai_compatible' | 'codex_cli';
 export interface Profile {
   id: string;
   name: string;
+  provider_type?: ProviderType;
   base_url: string;
   model: string;
   capabilities: Capability[];
   secret_mode: 'session' | 'keyring' | 'env' | 'none';
-  env_var?: string;
+  env_var?: string | null;
   timeout_s?: number;
   max_concurrency?: number;
   input_price_per_million?: number | null;
   output_price_per_million?: number | null;
   has_key?: boolean;
+}
+export interface CodexStatus {
+  installed: boolean;
+  authenticated: boolean;
+  compatible?: boolean;
+  auth_method: string | null;
+  message: string;
+  version?: string | null;
+}
+export function profileModelLabel(profile?: Profile): string {
+  return profile?.model || (profile?.provider_type === 'codex_cli' ? 'Codex 默认模型' : '尚未分配模型');
 }
 export interface Defaults {
   window_ms: number;

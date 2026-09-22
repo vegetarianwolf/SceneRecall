@@ -4,7 +4,7 @@ from copy import deepcopy
 import pytest
 from PIL import Image
 
-from scenerecall.jobs import JobQueue, StopJob, canonical_ocr_frames
+from scenerecall.jobs import JobQueue, StopJob, canonical_ocr_frames, model_identity
 from scenerecall.library import Library, read_json
 from scenerecall.models import AnalysisInput, AssetInput
 from scenerecall.providers import AIResult, ProviderError
@@ -179,3 +179,98 @@ def test_switching_model_during_job_pauses_before_request(worker):
         queue.before_call(job["id"], original)
     assert queue.get(job["id"])["status"] == "paused"
     assert queue.providers.calls == []
+
+
+def test_legacy_api_profile_identity_matches_explicit_defaults(worker):
+    queue, _asset, _extractions = worker
+    legacy = queue.providers.get("test")
+    current = {**legacy, "provider_type": "openai_compatible", "protocol": None}
+    assert model_identity(current) == {"protocol": None, "base_url": "http://test.local/v1", "model": "synthetic"}
+    assert model_identity(legacy) == model_identity(current)
+    assert model_identity({**legacy, "protocol": None}) == model_identity(current)
+    queue.providers.profile = current
+    job = queue.add("index", {})
+    queue.before_call(job["id"], legacy)
+    assert queue.get(job["id"])["inflight_attempts"] == 3
+
+
+def test_switching_provider_type_during_job_pauses_before_request(worker):
+    queue, _asset, _extractions = worker
+    job = queue.add("index", {})
+    original = queue.providers.get("test")
+    # Keep all other fields identical to isolate provider routing in the identity.
+    queue.providers.profile["provider_type"] = "codex_cli"
+    with pytest.raises(StopJob):
+        queue.before_call(job["id"], original)
+    state = queue.get(job["id"])
+    assert state["status"] == "paused" and "连接类型" in state["message"]
+    assert queue.providers.calls == []
+
+
+@pytest.mark.asyncio
+async def test_switching_provider_type_before_execution_rejects_snapshot(worker):
+    queue, asset, _extractions = worker
+    request = AnalysisInput(asset_id=asset["id"], stages=["vision"], max_requests=100)
+    _, config = queue.validate(request, {"bindings": {"vision": "test"}})
+    job = queue.add("analysis", config, asset["id"])
+    queue.providers.profile["provider_type"] = "codex_cli"
+    await queue.execute(job["id"])
+    assert queue.get(job["id"])["status"] == "failed"
+    assert "配置已变化" in queue.get(job["id"])["error"]
+    assert queue.providers.calls == []
+
+
+def test_codex_estimate_keeps_subscription_cost_unknown(worker):
+    queue, asset, _extractions = worker
+    # Even stale API rates must not turn subscription use into a dollar estimate.
+    queue.providers.profile.update(provider_type="codex_cli", base_url="", model="")
+    request = AnalysisInput(asset_id=asset["id"], stages=["vision", "subtitle"])
+    estimate = queue.estimate(request, {"bindings": {"vision": "test", "subtitle": "test"}})
+    assert estimate["estimated_requests"] == 2
+    assert estimate["cost_estimate"] is None
+    assert any("订阅额度" in warning and "并不表示免费" in warning for warning in estimate["warnings"])
+    assert queue.estimated_call_cost(queue.providers.get("test"), frames=4) is None
+
+
+@pytest.mark.parametrize("stage", ["vision", "subtitle"])
+def test_codex_analysis_rejects_monetary_budget(worker, stage):
+    queue, asset, _extractions = worker
+    queue.providers.profile.update(provider_type="codex_cli", base_url="", model="")
+    request = AnalysisInput(asset_id=asset["id"], stages=[stage], max_cost=1)
+    with pytest.raises(ValueError, match="Codex CLI.*移除费用预算"):
+        queue.validate(request, {"bindings": {stage: "test"}})
+    assert queue.list() == []
+
+
+def test_codex_resume_rejects_monetary_budget_and_keeps_request_limit(worker):
+    queue, asset, _extractions = worker
+    queue.providers.profile.update(provider_type="codex_cli", base_url="", model="")
+    profile = queue.providers.get("test")
+    request = AnalysisInput(asset_id=asset["id"], stages=["vision"], max_requests=2)
+    _, config = queue.validate(request, {"bindings": {"vision": "test"}})
+    job = queue.add("analysis", config, asset["id"])
+    with pytest.raises(StopJob):
+        queue.before_call(job["id"], profile)
+    assert "剩余请求预算" in queue.get(job["id"])["message"]
+    with pytest.raises(ValueError, match="Codex CLI.*移除费用预算"):
+        queue.control(job["id"], "resume", {"max_cost": 1})
+    assert queue.get(job["id"])["config"]["max_cost"] is None
+    queue.control(job["id"], "resume", {"max_requests": 3})
+    queue.before_call(job["id"], profile)
+    queue.account(job["id"], AIResult({}, {"input_tokens": 5}, 1, None))
+    state = queue.get(job["id"])
+    assert state["request_count"] == 1 and state["cost"] is None and state["cost_incomplete"]
+    assert state["usage"]["input_tokens"] == 5
+    with pytest.raises(StopJob):
+        queue.before_call(job["id"], profile)
+
+
+def test_codex_restored_monetary_budget_pauses_before_request(worker):
+    queue, _asset, _extractions = worker
+    queue.providers.profile.update(provider_type="codex_cli", base_url="", model="")
+    job = queue.add("index", {"max_cost": 1, "max_requests": 10})
+    with pytest.raises(StopJob):
+        queue.before_call(job["id"], queue.providers.get("test"))
+    state = queue.get(job["id"])
+    assert state["status"] == "paused" and "Codex CLI" in state["message"]
+    assert state["request_count"] == 0 and queue.providers.calls == []

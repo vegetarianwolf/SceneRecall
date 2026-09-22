@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
+from . import codex_cli
 from .jobs import JobQueue
 from .library import Library, atomic_json, read_json, safe_id, uid
 from .models import AnalysisInput, AnnotationInput, AssetInput, SearchInput
@@ -158,8 +159,17 @@ def create_app(data_dir: Path | None = None, start_worker=True, providers=None, 
     async def profiles():
         return providers.list()
 
+    @app.get("/api/codex/status")
+    async def codex_status():
+        return await codex_cli.status()
+
     @app.post("/api/profiles")
     async def profile_save(payload: dict = Body(...)):
+        if payload.get("id") and isinstance(payload.get("capabilities"), list):
+            removed = [capability for capability, profile_id in settings()["bindings"].items()
+                       if profile_id == payload["id"] and capability not in payload["capabilities"]]
+            if removed:
+                raise ValueError("请先在能力分配中解除以下绑定并保存，再修改连接：" + "、".join(removed))
         return await asyncio.to_thread(providers.upsert, payload)
 
     @app.delete("/api/profiles/{profile_id}")
